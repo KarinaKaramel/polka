@@ -117,6 +117,66 @@ const b64 = d => String(d).split(',')[1];
 const blobToB64 = blob => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = () => rej(r.error); r.readAsDataURL(blob); });
 async function pool(arr, n, fn) { const out = new Array(arr.length); let i = 0; await Promise.all(Array.from({ length: Math.min(n, arr.length) }, async () => { while (i < arr.length) { const k = i++; out[k] = await fn(arr[k], k); } })); return out; }
 
+/* Умный выбор кадров: для каждого шага берём несколько кадров из его фрагмента,
+   выбираем самый резкий и светлый и следим, чтобы у разных шагов кадры не повторялись. */
+async function pickFrames(blob, targets, max = 960) {
+  const out = {}; if (!targets.length) return out;
+  const url = URL.createObjectURL(blob);
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto'; v.src = url;
+  const wait = (ev, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('timeout ' + ev)), ms); v.addEventListener(ev, () => { clearTimeout(t); res(); }, { once: true }); });
+  const sc = document.createElement('canvas'), sx = sc.getContext('2d', { willReadFrequently: true });
+  const seek = async t => { const s = wait('seeked', 7000); v.currentTime = t; await s; await new Promise(r => requestAnimationFrame(() => r())); };
+  const measure = () => {
+    const w = 160, h = Math.max(40, Math.round(160 * (v.videoHeight || 16) / (v.videoWidth || 9)));
+    sc.width = w; sc.height = h; sx.drawImage(v, 0, 0, w, h);
+    const d = sx.getImageData(0, 0, w, h).data, g = new Float32Array(w * h);
+    let br = 0; for (let i = 0; i < w * h; i++) { g[i] = .299 * d[i * 4] + .587 * d[i * 4 + 1] + .114 * d[i * 4 + 2]; br += g[i]; }
+    br /= w * h;
+    let s = 0, s2 = 0, n = 0;
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x, l = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w]; s += l; s2 += l * l; n++; }
+    const sharp = s2 / n - (s / n) ** 2;
+    const sig = []; const bw = w / 12, bh = h / 12;
+    for (let by = 0; by < 12; by++) for (let bx = 0; bx < 12; bx++) sig.push(g[Math.floor((by + .5) * bh) * w + Math.floor((bx + .5) * bw)]);
+    return { sharp, br, sig };
+  };
+  const diff = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; };
+  const chosen = [], chosenT = new Set();
+  try {
+    const ready = v.readyState >= 2 ? null : wait('loadeddata', 15000);
+    v.play().then(() => v.pause()).catch(() => { });
+    if (ready) await ready;
+    const D = v.duration && isFinite(v.duration) ? v.duration : 60;
+    const clamp = t => Math.min(Math.max(t, .1), Math.max(D - .15, .1));
+    for (const tg of targets) {
+      try {
+        let a = +tg.from, b = +tg.to;
+        if (!(isFinite(a) && isFinite(b) && b > a)) { a = tg.t - 1.5; b = tg.t + 1; }
+        a = clamp(a); b = clamp(b); if (b - a < .4) { a = clamp(a - .5); b = clamp(b + .5); }
+        const N = Math.min(8, Math.max(4, Math.round((b - a) / .4) + 1));
+        const cands = [];
+        for (let k = 0; k < N; k++) { const t = Math.round((a + (b - a) * k / (N - 1)) * 10) / 10; await seek(t); cands.push({ t, ...measure() }); }
+        const maxSharp = Math.max(...cands.map(c => c.sharp)) || 1;
+        for (const c of cands) c.val = c.sharp / maxSharp - (c.br < 35 ? .6 : 0) - (c.br > 235 ? .3 : 0) - .08 * Math.abs(c.t - clamp(tg.t));
+        cands.sort((x, y) => y.val - x.val);
+        let best = cands[0];
+        if (!tg.cover && chosen.length) {
+          const pool2 = cands.filter(c => !chosenT.has(c.t));
+          const pool = pool2.length ? pool2 : cands;
+          for (const c of pool) c.md = Math.min(...chosen.map(s => diff(s, c.sig)));
+          best = pool.find(c => c.val > cands[0].val - .45 && c.md > 9) || pool.slice().sort((x, y) => (y.val + .03 * y.md) - (x.val + .03 * x.md))[0];
+        }
+        if (!tg.cover) { chosen.push(best.sig); chosenT.add(best.t); }
+        tg.o.t = best.t;
+        await seek(best.t);
+        out['t' + best.t] = drawScaled(v, v.videoWidth, v.videoHeight, max, .82);
+      } catch (e) { console.warn('frame', e); }
+    }
+  } catch (e) { console.warn('frames', e); }
+  finally { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) { } URL.revokeObjectURL(url); }
+  return out;
+}
+
 async function grabFrames(blob, times, max = 640) {
   const out = {}; if (!times.length) return out;
   const url = URL.createObjectURL(blob);
@@ -243,7 +303,7 @@ watch (фильмы, сериалы, аниме, видео): {"titles":[{"title
 ideas (советы, цитаты, мысли, всё остальное): {"points":["подробные пункты"], "quote":""}
 
 Правила:
-- Для видео у каждого шага/упражнения/товара ставь "t" — секунду, где это лучше всего ВИДНО (из неё вырежем кадр-иллюстрацию). Для картинок — "image" с индексом.
+- Для видео у каждого шага/упражнения/товара/вещи добавь три поля: "t_from" и "t_to" — начало и конец фрагмента видео, где показан именно этот шаг, и "t" — лучший момент внутри него (с точностью до 0,1 с). Из этого фрагмента вырежем кадр-иллюстрацию, поэтому "t" выбирай ближе к концу шага, когда результат хорошо виден, камера не дёргается и кадр не перекрыт текстом или руками. У разных шагов фрагменты и "t" должны быть РАЗНЫМИ — не ставь двум шагам одну и ту же секунду. Для картинок вместо этого — "image" с индексом.
 - Если это доска или подборка картинок с книгами — распознай ВСЕ книги на всех картинках (обложки, корешки, списки), без повторов. Аналогично для фильмов, мест и товаров.
 - Если в посте несколько тем — выбери главную.`;
 }
@@ -262,13 +322,21 @@ function normalize(r) {
   for (const k of ['tips', 'tools', 'equipment', 'materials', 'points']) if (d[k]) d[k] = d[k].map(x => typeof x === 'string' ? x : (x.text || x.name || JSON.stringify(x)));
   return r;
 }
+function collectTargets(r) {
+  const out = [];
+  const walk = x => { if (!x || typeof x !== 'object') return; if (Array.isArray(x)) return x.forEach(walk); if (typeof x.t === 'number' && x.t >= 0) out.push({ o: x, t: x.t, from: x.t_from, to: x.t_to }); Object.values(x).forEach(walk); };
+  walk(r.data);
+  if (r.cover && typeof r.cover.t === 'number') out.push({ o: r.cover, t: r.cover.t, cover: true });
+  else out.push({ o: (r.cover = { t: Math.max(1, ...out.map(x => x.t)) }), t: r.cover.t, cover: true });
+  return out.slice(0, 32);
+}
 function collectRefs(r) {
   const times = new Set(), imgs = new Set();
   const walk = x => { if (!x || typeof x !== 'object') return; if (Array.isArray(x)) return x.forEach(walk); if (typeof x.t === 'number' && x.t >= 0) times.add(Math.round(x.t * 2) / 2); if (Number.isInteger(x.image) && x.image >= 0) imgs.add(x.image); Object.values(x).forEach(walk); };
   walk(r.data); if (r.cover) walk([r.cover]);
   return { times: [...times].sort((a, b) => a - b).slice(0, 30), imgs: [...imgs].slice(0, 50) };
 }
-const fkey = o => o == null ? null : (typeof o.t === 'number' && o.t >= 0 ? 't' + Math.round(o.t * 2) / 2 : Number.isInteger(o.image) ? 'i' + o.image : null);
+const fkey = o => o == null ? null : (typeof o.t === 'number' && o.t >= 0 ? 't' + Math.round(o.t * 10) / 10 : Number.isInteger(o.image) ? 'i' + o.image : null);
 
 /* ---------------- разбор ссылки ---------------- */
 const pendingFiles = new Map();
@@ -319,9 +387,8 @@ async function processItem(it) {
   const media = { frames: {}, cover: null, rev };
   const refs = collectRefs(r);
   if (video) {
-    const times = [...refs.times]; if (!times.length || !(r.cover && typeof r.cover.t === 'number')) times.push(1);
-    const fr = await grabFrames(video, times);
-    for (const [t, d] of Object.entries(fr)) media.frames['t' + t] = d;
+    setStage(it, 'Подбираю лучшие кадры…');
+    Object.assign(media.frames, await pickFrames(video, collectTargets(r)));
   }
   for (const i of refs.imgs) if (imgs[i]) { try { media.frames['i' + i] = await shrink(imgs[i].blob, 640, .76); } catch (e) { } }
   const ck = fkey(r.cover);
