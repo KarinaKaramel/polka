@@ -239,9 +239,23 @@ async function pinterest(u) {
       for (const b of pg.blocks || []) { if (b.text) out.text += '\n' + b.text; const bv = b.video && findMp4(b.video); if (bv && !out.video) out.video = bv; }
     }
     if (!out.video && p.videos) out.video = findMp4(p.videos);
+    // карусель (несколько картинок в одном пине) — есть только на странице пина
+    try {
+      const html = await (await fetch(`https://www.pinterest.com/pin/${pin[1]}/`, { headers: { 'User-Agent': DESK_UA, 'Accept': 'text/html', 'Accept-Language': 'ru,en;q=0.8' } })).text();
+      const slots = jsonArrayAfter(html, '"carouselSlots":') || jsonArrayAfter(html, '"carousel_slots":');
+      if (slots && slots.length > 1) {
+        out.images = slots.map(sl => (sl.images_1200x || sl.images_736x || sl.images_564x || {}).url || bestPinImage(sl.images)).filter(Boolean);
+        const det = [...new Set(slots.map(sl => sl.details || sl.title).filter(Boolean))];
+        for (const d of det) if (!out.text.includes(d)) out.text += '\n' + d;
+        out.kind = 'carousel';
+      }
+    } catch (e) { out.warnings.push('carousel: ' + e.message); }
     out.thumb = out.images[0];
     // ссылка на источник (часто блог с рецептом) — подтягиваем текст
-    if (p.link && !/pinterest\./.test(p.link)) {
+    if (p.link && /instagram\.com\/(p|reel|reels|tv)\//.test(p.link)) {
+      out.source = p.link;
+      try { const g = await instagram(new URL(p.link)); if (g.text && g.text.length > 20) out.text += '\n\n--- Подпись к посту в Instagram ---\n' + g.text; } catch (e) { out.warnings.push('instagram: ' + e.message); }
+    } else if (p.link && !/pinterest\./.test(p.link)) {
       out.source = p.link;
       try { const g = await generic(p.link); if (g.text) out.text += '\n\n--- Текст со страницы-источника ---\n' + g.text; if (!out.title) out.title = g.title; } catch (e) { out.warnings.push('источник: ' + e.message); }
     }
@@ -347,6 +361,16 @@ async function generic(url, platform = 'web', ua = DESK_UA) {
 }
 
 /* ---------- utils ---------- */
+function jsonArrayAfter(s, key) {
+  const i = s.indexOf(key); if (i < 0) return null;
+  let j = s.indexOf('[', i), depth = 0, inStr = false, esc = false;
+  for (let k = j; k < s.length; k++) {
+    const ch = s[k];
+    if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true; else if (ch === '[' || ch === '{') depth++; else if (ch === ']' || ch === '}') { depth--; if (depth === 0) return JSON.parse(s.slice(j, k + 1)); }
+  }
+  return null;
+}
 function absUrl(s, base) { try { return s ? new URL(s, base).href : ''; } catch (e) { return ''; } }
 function unescapeOnce(s) { return s.replace(/\\(["\\/])/g, '$1'); }
 function pickJsonStr(s, key) {
